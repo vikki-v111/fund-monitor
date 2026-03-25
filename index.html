@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Fund Monitor · 基金追踪</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #F7F7F5; font-family: 'DM Mono', 'Courier New', monospace; color: #1A1A18; }
+input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+select option { background: #fff; }
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+button:hover { filter: brightness(0.93); }
+.ai-report p { margin-bottom: 10px; line-height: 1.7; }
+.ai-report strong { color: #3A6B3A; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ─── Supabase ──────────────────────────────────────────────────────────────────
+const SURL = "https://wttakreqczdigpvhxqde.supabase.co";
+const SKEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind0dGFrcmVxY3pkaWdwdmh4cWRlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ0NjA2MTksImV4cCI6MjA5MDAzNjYxOX0.5ZFnlDlXorOYPZ-5SFcyGhqVbitKXCtwKAsWY6EMzzE";
+const sbFetch = (path, opts={}) => {
+  const { headers: extraHeaders, ...restOpts } = opts;
+  return fetch(`${SURL}/rest/v1/${path}`, {
+    ...restOpts,
+    headers: { apikey:SKEY, Authorization:`Bearer ${SKEY}`, "Content-Type":"application/json", Prefer:"return=minimal", ...extraHeaders }
+  });
+};
+async function dbLoad(key) {
+  try {
+    if (key==="funds") { const r=await sbFetch("funds?select=id,data"); if(!r.ok) return null; return (await r.json()).map(r=>r.data); }
+    if (key==="ph") { const r=await sbFetch("portfolio_history?select=date,value&order=date.asc"); if(!r.ok) return null; return (await r.json()).map(r=>({date:r.date,value:parseFloat(r.value)})); }
+  } catch { return null; }
+}
+async function dbSave(key, val) {
+  try {
+    if (key==="funds") {
+      const rows=val.map(f=>({id:f.id,data:f,updated_at:new Date().toISOString()}));
+      const r = await sbFetch("funds",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify(rows)});
+      if (!r.ok) { const err=await r.text(); console.error("Save failed:",r.status,err); showToast("保存失败: "+r.status,"error"); return; }
+      const ex=await sbFetch("funds?select=id"); if(ex.ok){const exIds=(await ex.json()).map(r=>r.id);const curIds=val.map(f=>f.id);for(const id of exIds.filter(id=>!curIds.includes(id))) await sbFetch(`funds?id=eq.${id}`,{method:"DELETE"});}
+      if(val.length>0) showToast("已保存 "+val.length+" 条持仓","ok");
+    }
+    if (key==="ph") { if(!val.length) return; await sbFetch("portfolio_history",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify(val.map(r=>({date:r.date,value:r.value})))}); }
+  } catch(e){console.error(e); showToast("网络错误: "+e.message,"error");}
+}
+
+function showToast(msg, type) {
+  const old = document.getElementById("_toast"); if(old) old.remove();
+  const el = document.createElement("div");
+  el.id="_toast";
+  el.textContent=msg;
+  el.style.cssText=`position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 20px;border-radius:20px;font-size:12px;font-family:monospace;z-index:9999;transition:opacity 0.3s;background:${type==="ok"?"#2E7D32":"#C0392B"};color:#fff;box-shadow:0 4px 12px rgba(0,0,0,0.15)`;
+  document.body.appendChild(el);
+  setTimeout(()=>{el.style.opacity="0";setTimeout(()=>el.remove(),300);},2500);
+}
+
+// ─── 天天基金实时净值 JSONP ────────────────────────────────────────────────────
+function fetchNav(code) {
+  return new Promise((resolve,reject)=>{
+    const cb=`_fcb_${code}_${Date.now()}`;
+    const t=setTimeout(()=>{delete window[cb];reject(new Error("timeout"));},8000);
+    window[cb]=(d)=>{clearTimeout(t);delete window[cb];if(d?.fundcode){const nav=parseFloat(d.gsz)||parseFloat(d.dwjz)||null;resolve({nav,name:d.name,isEstimate:!!(parseFloat(d.gsz)&&d.gszzl)});}else reject(new Error("no data"));};
+    const s=document.createElement("script");
+    s.src=`https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}&callback=${cb}`;
+    s.onerror=()=>{clearTimeout(t);delete window[cb];reject(new Error("err"));};
+    document.head.appendChild(s);
+  });
+}
+
+// ─── 天天基金历史净值（通过 CORS 代理）─────────────────────────────────────────
+async function fetchHistoricalNav(code, pageSize=1500) {
+  const url = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}&pageIndex=1&pageSize=${pageSize}&startDate=&endDate=`;
+  const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+  const r = await fetch(proxy);
+  if (!r.ok) throw new Error("fetch failed");
+  const data = await r.json();
+  const items = data?.Data?.LSJZList || [];
+  // 返回升序 [{date, nav}]
+  return items.map(d=>({date:d.FSRQ, nav:parseFloat(d.DWJZ)})).reverse();
+}
+
+// ─── 时段收益率计算 ────────────────────────────────────────────────────────────
+function calcPeriodReturns(navList) {
+  if (!navList.length) return {};
+  const today = navList[navList.length-1];
+  const curNav = today.nav;
+  const todayDate = new Date(today.date);
+
+  const findNav = (daysAgo) => {
+    const target = new Date(todayDate); target.setDate(target.getDate()-daysAgo);
+    let closest = navList[0];
+    for (const n of navList) { if (new Date(n.date) <= target) closest=n; else break; }
+    return closest.nav;
+  };
+  const ytdNav = (() => {
+    const jan1 = new Date(todayDate.getFullYear(), 0, 1);
+    let closest = navList[0];
+    for (const n of navList) { if (new Date(n.date) < jan1) closest=n; else break; }
+    return closest.nav;
+  })();
+  const pct = (base) => base ? ((curNav-base)/base*100) : null;
+  return {
+    "今年以来": pct(ytdNav),
+    "近1月": pct(findNav(30)),
+    "近3月": pct(findNav(90)),
+    "近6月": pct(findNav(180)),
+    "近1年": pct(findNav(365)),
+    "近3年": pct(findNav(365*3)),
+    "近5年": pct(findNav(365*5)),
+    "建仓以来": pct(navList[0]?.nav),
+  };
+}
+
+// ─── Claude AI 分析 ────────────────────────────────────────────────────────────
+async function callClaudeAnalysis(fund, returns, navList) {
+  const recent90 = navList.slice(-90);
+  const navStr = recent90.map(n=>`${n.date}:${n.nav}`).join(",");
+  const returnsStr = Object.entries(returns).map(([k,v])=>`${k}: ${v!=null?v.toFixed(2)+"%":"N/A"}`).join("，");
+
+  const prompt = `你是一位专业的基金分析师。请分析以下基金数据并给出投资建议。
+
+基金名称：${fund.name}
+基金代码：${fund.code}
+基金类型：${fund.type}
+用户持仓成本净值：${fund.costNav}
+当前净值：${fund.currentNav}
+
+各时段收益率：${returnsStr}
+
+近90日净值数据（日期:净值）：${navStr}
+
+请从以下四个维度给出分析（每点100字左右）：
+1. 【走势判断】当前处于什么阶段（上涨/下跌/震荡），近期趋势如何
+2. 【买卖建议】当前是否适合买入/持有/减仓，给出明确结论和理由
+3. 【定投适合度】这只基金适不适合做定投，为什么，如果适合建议什么频率
+4. 【做T可行性】适不适合高抛低吸做T，基金波动率和流动性如何
+
+最后给出一个综合评分（满分5星）和一句话总结。
+
+注意：这是辅助参考分析，请在结尾注明"投资有风险，以上为AI辅助分析，不构成投资建议"。`;
+
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const data = await resp.json();
+  return data.content?.[0]?.text || "分析失败，请重试";
+}
+
+// ─── 设计 token ────────────────────────────────────────────────────────────────
+const COLORS=["#7BA7BC","#A8C5A0","#D4956A","#C5A8C5","#8FB8AD","#E8B4B0","#B0C5E8","#E8D5B0"];
+const C={bg:"#F7F7F5",card:"#FFFFFF",border:"#E4E4DF",accent:"#3A6B3A",accentDim:"#EAF2EA",text:"#1A1A18",muted:"#8A8A80",red:"#C0392B",green:"#2E7D32",gold:"#B8860B",blue:"#2563A8"};
+const ST={loading:{label:"拉取中…",color:C.blue},ok:{label:"已更新",color:C.green},estimate:{label:"盘中估值",color:C.gold},error:{label:"拉取失败",color:C.red}};
+const fmt=(n,d=2)=>typeof n==="number"?n.toLocaleString("zh-CN",{minimumFractionDigits:d,maximumFractionDigits:d}):"--";
+const fmtPct=n=>`${n>=0?"+":""}${fmt(n)}%`;
+const todayStr=()=>new Date().toLocaleDateString("zh-CN",{month:"2-digit",day:"2-digit"}).replace("/","-");
+const emptyFund=()=>({id:Date.now().toString(),code:"",name:"",type:"A股公募",buyAmount:"",shares:"",costNav:"",currentNav:"",history:[]});
+
+// ─── Chart helpers ─────────────────────────────────────────────────────────────
+function PieChart({data}) {
+  const ref=useRef(), inst=useRef();
+  useEffect(()=>{
+    if(!ref.current||!data.length) return;
+    if(inst.current) inst.current.destroy();
+    inst.current=new Chart(ref.current,{type:"doughnut",data:{labels:data.map(d=>d.name),datasets:[{data:data.map(d=>d.value),backgroundColor:COLORS,borderWidth:0,hoverOffset:4}]},options:{cutout:"60%",plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`¥${fmt(c.raw)}`}}},animation:{duration:400}}});
+    return ()=>{if(inst.current)inst.current.destroy();};
+  },[JSON.stringify(data)]);
+  return React.createElement("canvas",{ref,height:160});
+}
+
+function LineChart({data,color,label}) {
+  const ref=useRef(), inst=useRef();
+  useEffect(()=>{
+    if(!ref.current||data.length<2) return;
+    if(inst.current) inst.current.destroy();
+    inst.current=new Chart(ref.current,{
+      type:"line",
+      data:{labels:data.map(d=>d.date),datasets:[{label:label||"",data:data.map(d=>d.value??d.nav),borderColor:color||C.accent,borderWidth:1.5,fill:true,backgroundColor:(ctx)=>{const g=ctx.chart.ctx.createLinearGradient(0,0,0,ctx.chart.height);g.addColorStop(0,(color||C.accent)+"33");g.addColorStop(1,(color||C.accent)+"00");return g;},pointRadius:1,tension:0.3}]},
+      options:{plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`${fmt(c.raw,4)}`}}},scales:{x:{grid:{display:false},ticks:{font:{size:9},color:C.muted,maxTicksLimit:8}},y:{grid:{color:"#f0f0ee"},ticks:{font:{size:9},color:C.muted}}},animation:{duration:300}}
+    });
+    return ()=>{if(inst.current)inst.current.destroy();};
+  },[JSON.stringify(data),color]);
+  return React.createElement("canvas",{ref,height:180});
+}
+
+// ═══════════════════════════ APP ════════════════════════════════════════════
+function App() {
+  const [funds,setFunds]=useState([]);
+  const [ph,setPh]=useState([]);
+  const [view,setView]=useState("dash"); // dash|add|edit|detail|analysis
+  const [activeId,setActiveId]=useState(null);
+  const [form,setForm]=useState(emptyFund());
+  const [navId,setNavId]=useState(null);
+  const [navInput,setNavInput]=useState("");
+  const [loaded,setLoaded]=useState(false);
+  const [fs,setFs]=useState({});
+
+  useEffect(()=>{(async()=>{const f=await dbLoad("funds");if(f)setFunds(f);const p=await dbLoad("ph");if(p)setPh(p);setLoaded(true);})();}, []);
+  useEffect(()=>{if(loaded)dbSave("funds",funds);},[funds,loaded]);
+  useEffect(()=>{if(loaded)dbSave("ph",ph);},[ph,loaded]);
+
+  const autoFetch=useCallback(async(override)=>{
+    const src=override??funds;
+    const targets=src.filter(f=>/^\d{6}$/.test(f.code));
+    if(!targets.length) return;
+    const td=todayStr();
+    setFs(p=>{const n={...p};targets.forEach(f=>{n[f.id]="loading";});return n;});
+    const results=await Promise.allSettled(targets.map(f=>fetchNav(f.code)));
+    setFunds(prev=>prev.map(fund=>{
+      const i=targets.findIndex(t=>t.id===fund.id);if(i===-1)return fund;
+      const res=results[i];
+      if(res.status==="fulfilled"&&res.value?.nav){
+        const{nav,name:fn,isEstimate}=res.value;
+        const hist=[...(fund.history||[])];
+        if(hist[hist.length-1]?.date===td)hist[hist.length-1]={date:td,nav};else hist.push({date:td,nav});
+        setFs(p=>({...p,[fund.id]:isEstimate?"estimate":"ok"}));
+        return {...fund,currentNav:String(nav),history:hist,name:fund.name||fn||fund.name};
+      }
+      setFs(p=>({...p,[fund.id]:"error"}));return fund;
+    }));
+  },[funds]);
+
+  useEffect(()=>{if(loaded&&funds.length>0)autoFetch(funds);},[loaded]);
+
+  const stats=funds.map(f=>{
+    const buy=parseFloat(f.buyAmount)||0,cost=parseFloat(f.costNav)||1,cur=parseFloat(f.currentNav)||cost;
+    const shares=buy/cost,curValue=shares*cur;
+    return{...f,buy,cost,cur,shares,curValue,pnl:curValue-buy,pnlPct:((cur-cost)/cost)*100};
+  });
+  const totalBuy=stats.reduce((s,f)=>s+f.buy,0);
+  const totalValue=stats.reduce((s,f)=>s+f.curValue,0);
+  const totalPnl=totalValue-totalBuy;
+  const totalPnlPct=totalBuy>0?(totalPnl/totalBuy)*100:0;
+
+  useEffect(()=>{
+    if(!loaded||totalValue===0)return;
+    const td=todayStr();
+    setPh(prev=>{const arr=[...prev],snap={date:td,value:totalValue};if(arr[arr.length-1]?.date===td)arr[arr.length-1]=snap;else arr.push(snap);return arr.slice(-90);});
+  },[totalValue,loaded]);
+
+  const openAdd=()=>{setForm(emptyFund());setView("add");};
+  const openEdit=f=>{setForm({...f});setView("edit");};
+  const saveFund=()=>{
+    if(!form.name||!form.buyAmount||!form.shares)return;
+    const costNav = form.costNav || String((parseFloat(form.buyAmount)/parseFloat(form.shares)).toFixed(4));
+    const entry={...form,costNav,currentNav:costNav,history:form.history?.length?form.history:[{date:todayStr(),nav:parseFloat(costNav)}]};
+    if(view==="add"){setFunds(p=>[...p,entry]);setTimeout(()=>autoFetch([entry]),200);}
+    else setFunds(p=>p.map(f=>f.id===entry.id?entry:f));
+    setView("dash");
+  };
+  const delFund=id=>{if(window.confirm("确认删除？"))setFunds(p=>p.filter(f=>f.id!==id));};
+  const confirmNav=id=>{
+    const val=parseFloat(navInput);if(!val)return;
+    const td=todayStr();
+    setFunds(prev=>prev.map(f=>{if(f.id!==id)return f;const hist=[...(f.history||[])];if(hist[hist.length-1]?.date===td)hist[hist.length-1]={date:td,nav:val};else hist.push({date:td,nav:val});return{...f,currentNav:String(val),history:hist};}));
+    setNavId(null);setNavInput("");
+  };
+
+  if(!loaded) return <div style={{height:"100vh",display:"flex",alignItems:"center",justifyContent:"center",color:C.muted}}>加载中…</div>;
+
+  const activeF=stats.find(s=>s.id===activeId);
+
+  if(view==="analysis"&&activeF) return <Analysis fund={activeF} onBack={()=>setView("detail")}/>;
+  if(view==="detail"&&activeF) return <Detail fund={activeF} onBack={()=>setView("dash")} onEdit={()=>openEdit(activeF)} navId={navId} navInput={navInput} setNavInput={setNavInput} setNavId={setNavId} confirmNav={confirmNav} fs={fs} onFetch={()=>autoFetch([activeF])} onAnalysis={()=>setView("analysis")}/>;
+  if(view==="add"||view==="edit") return <Form form={form} setForm={setForm} onSave={saveFund} onCancel={()=>setView("dash")} isEdit={view==="edit"}/>;
+  return <Dash stats={stats} totalBuy={totalBuy} totalValue={totalValue} totalPnl={totalPnl} totalPnlPct={totalPnlPct} ph={ph} onAdd={openAdd} onEdit={openEdit} onDel={delFund} onDetail={id=>{setActiveId(id);setView("detail");}} navId={navId} navInput={navInput} setNavInput={setNavInput} setNavId={setNavId} confirmNav={confirmNav} fs={fs} onFetch={()=>autoFetch()}/>;
+}
+
+// ═══════════════════════════ AI ANALYSIS VIEW ════════════════════════════════
+function Analysis({fund, onBack}) {
+  const [status, setStatus]=useState("idle"); // idle|loading|done|error
+  const [navList, setNavList]=useState([]);
+  const [returns, setReturns]=useState({});
+  const [report, setReport]=useState("");
+  const [period, setPeriod]=useState("近1年");
+  const [navLoading, setNavLoading]=useState(false);
+
+  const periodDays={"今年以来":null,"近1月":30,"近3月":90,"近6月":180,"近1年":365,"近3年":1095,"近5年":1825,"建仓以来":null};
+
+  // 加载历史净值
+  useEffect(()=>{
+    if(!fund.code) return;
+    setNavLoading(true);
+    fetchHistoricalNav(fund.code).then(list=>{
+      setNavList(list);
+      setReturns(calcPeriodReturns(list));
+      setNavLoading(false);
+    }).catch(()=>setNavLoading(false));
+  },[fund.code]);
+
+  // 过滤图表数据
+  const chartData=()=>{
+    if(!navList.length) return [];
+    if(period==="建仓以来") return navList.map(n=>({date:n.date.slice(5),value:n.nav}));
+    if(period==="今年以来"){const yr=new Date().getFullYear();return navList.filter(n=>n.date.startsWith(yr)).map(n=>({date:n.date.slice(5),value:n.nav}));}
+    const days=periodDays[period]||365;
+    return navList.slice(-days).map(n=>({date:n.date.slice(5),value:n.nav}));
+  };
+
+  const runAnalysis=async()=>{
+    if(!navList.length){alert("历史净值数据未加载完成，请稍候");return;}
+    setStatus("loading");setReport("");
+    try{const r=await callClaudeAnalysis(fund,returns,navList);setReport(r);setStatus("done");}
+    catch(e){setStatus("error");}
+  };
+
+  const retColor=v=>v==null?"#8A8A80":v>=0?"#2E7D32":"#C0392B";
+
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,paddingBottom:80}}>
+      {/* 顶栏 */}
+      <div style={{padding:"20px 24px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:12,position:"sticky",top:0,background:C.bg,zIndex:10}}>
+        <button onClick={onBack} style={{...iBtn,fontSize:15,padding:"4px 10px"}}>←</button>
+        <div style={{flex:1}}>
+          <div style={{fontSize:15}}>{fund.name}</div>
+          <div style={{fontSize:10,color:C.muted}}>{fund.code} · AI 分析</div>
+        </div>
+        <button onClick={runAnalysis} disabled={status==="loading"} style={btn(C.accent,"#fff",true,status==="loading")}>
+          {status==="loading"?"分析中…":"✦ AI 分析"}
+        </button>
+      </div>
+
+      {/* 时段收益率 */}
+      <div style={{padding:"20px 24px 0"}}>
+        <div style={sLabel}>各时段收益率</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:1,background:C.border,borderRadius:6,overflow:"hidden"}}>
+          {Object.entries(returns).map(([k,v])=>(
+            <div key={k} style={{background:C.card,padding:"12px 8px",textAlign:"center"}}>
+              <div style={{fontSize:9,color:C.muted,marginBottom:4}}>{k}</div>
+              <div style={{fontSize:13,fontWeight:600,color:retColor(v)}}>{v!=null?fmtPct(v):"--"}</div>
+            </div>
+          ))}
+        </div>
+        {navLoading&&<div style={{textAlign:"center",color:C.muted,fontSize:11,marginTop:8}}>加载历史数据中…</div>}
+      </div>
+
+      {/* 净值走势图 */}
+      <div style={{padding:"20px 24px 0"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={sLabel}>净值走势</div>
+          <div style={{display:"flex",gap:4,flexWrap:"wrap",justifyContent:"flex-end"}}>
+            {["近1月","近3月","近6月","近1年","近3年","建仓以来"].map(p=>(
+              <button key={p} onClick={()=>setPeriod(p)} style={{...iBtn,fontSize:10,padding:"3px 8px",background:period===p?C.accent:"transparent",color:period===p?"#fff":C.muted,border:`1px solid ${period===p?C.accent:C.border}`}}>{p}</button>
+            ))}
+          </div>
+        </div>
+        {chartData().length>1 ? <LineChart data={chartData()} color={C.gold} label="净值"/> : <div style={{height:180,border:`1px dashed ${C.border}`,borderRadius:4,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:11}}>{navLoading?"加载中…":"暂无数据"}</div>}
+      </div>
+
+      {/* 持仓信息 */}
+      <div style={{padding:"20px 24px 0"}}>
+        <div style={sLabel}>我的持仓</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:1,background:C.border,borderRadius:6,overflow:"hidden"}}>
+          {[{label:"成本净值",val:fmt(fund.cost,4)},{label:"当前净值",val:fmt(fund.cur,4)},{label:"持仓收益",val:fmtPct(fund.pnlPct),color:fund.pnl>=0?C.green:C.red}].map((item,i)=>(
+            <div key={i} style={{background:C.card,padding:"12px 16px"}}>
+              <div style={{fontSize:9,color:C.muted,marginBottom:4}}>{item.label}</div>
+              <div style={{fontSize:13,fontWeight:500,color:item.color||C.text}}>{item.val}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* AI 报告区 */}
+      <div style={{padding:"20px 24px"}}>
+        {status==="idle"&&(
+          <div style={{border:`1px dashed ${C.border}`,borderRadius:8,padding:"40px 24px",textAlign:"center",color:C.muted}}>
+            <div style={{fontSize:28,marginBottom:12}}>✦</div>
+            <div style={{fontSize:14,marginBottom:6}}>AI 智能分析</div>
+            <div style={{fontSize:11,marginBottom:20}}>基于历史净值数据，分析走势趋势、买卖时机<br/>定投适合度和做T可行性</div>
+            <button onClick={runAnalysis} style={{...btn(C.accent,"#fff"),padding:"10px 28px"}}>开始分析</button>
+          </div>
+        )}
+        {status==="loading"&&(
+          <div style={{border:`1px solid ${C.border}`,borderRadius:8,padding:"40px 24px",textAlign:"center",color:C.muted}}>
+            <div style={{fontSize:11,letterSpacing:2}}>AI 分析中，请稍候…</div>
+            <div style={{marginTop:16,height:3,background:C.border,borderRadius:2,overflow:"hidden"}}>
+              <div style={{height:"100%",background:C.accent,borderRadius:2,width:"60%",animation:"none"}}/>
+            </div>
+          </div>
+        )}
+        {status==="error"&&(
+          <div style={{border:`1px solid ${C.red}22`,borderRadius:8,padding:20,textAlign:"center",color:C.red,fontSize:12}}>
+            分析失败，请检查网络后重试
+            <br/><button onClick={runAnalysis} style={{...btn(C.red,"#fff",true),marginTop:12}}>重试</button>
+          </div>
+        )}
+        {status==="done"&&report&&(
+          <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:8,padding:20}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+              <div style={sLabel}>AI 分析报告</div>
+              <button onClick={runAnalysis} style={{...iBtn,fontSize:10,color:C.accent}}>重新分析</button>
+            </div>
+            <div className="ai-report" style={{fontSize:13,lineHeight:1.8,color:C.text,whiteSpace:"pre-wrap"}}>{report}</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════ DASHBOARD ══════════════════════════════════════
+function Dash({stats,totalBuy,totalValue,totalPnl,totalPnlPct,ph,onAdd,onEdit,onDel,onDetail,navId,navInput,setNavInput,setNavId,confirmNav,fs,onFetch}) {
+  const isPos=totalPnl>=0;
+  const anyLoading=Object.values(fs).some(v=>v==="loading");
+  const pieData=stats.filter(f=>f.curValue>0).map(f=>({name:f.name||f.code,value:parseFloat(f.curValue.toFixed(2))}));
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,paddingBottom:80}}>
+      <div style={{padding:"32px 24px 0",borderBottom:`1px solid ${C.border}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+          <div>
+            <div style={{fontSize:11,letterSpacing:3,color:C.muted,textTransform:"uppercase",marginBottom:6}}>基金追踪</div>
+            <div style={{fontSize:26,fontWeight:300,letterSpacing:-0.5}}>Fund Monitor</div>
+          </div>
+          <div style={{display:"flex",gap:8,marginTop:4}}>
+            <button onClick={onFetch} disabled={anyLoading} style={btn(C.accentDim,C.accent,true,anyLoading)}>{anyLoading?"⟳ 更新中…":"⟳ 自动更新"}</button>
+            <button onClick={onAdd} style={btn(C.accent,"#fff")}>+ 添加</button>
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",marginTop:28}}>
+          {[{label:"总投入",val:`¥${fmt(totalBuy)}`},{label:"当前市值",val:`¥${fmt(totalValue)}`,hi:true},{label:"总盈亏",val:fmtPct(totalPnlPct),sub:`${totalPnl>=0?"+":""}¥${fmt(totalPnl)}`,color:isPos?C.green:C.red}].map((item,i)=>(
+            <div key={i} style={{padding:"20px 0",borderLeft:i>0?`1px solid ${C.border}`:"none",paddingLeft:i>0?20:0}}>
+              <div style={{fontSize:10,color:C.muted,letterSpacing:2,textTransform:"uppercase",marginBottom:6}}>{item.label}</div>
+              <div style={{fontSize:item.hi?20:16,color:item.color||C.text,fontWeight:item.hi?600:300}}>{item.val}</div>
+              {item.sub&&<div style={{fontSize:11,color:item.color,marginTop:2}}>{item.sub}</div>}
+            </div>
+          ))}
+        </div>
+      </div>
+      {stats.length===0?(
+        <div style={{textAlign:"center",padding:"80px 24px",color:C.muted}}>
+          <div style={{fontSize:40,marginBottom:16}}>◎</div><div>还没有持仓</div>
+          <div style={{fontSize:12,marginTop:8}}>填入6位基金代码，保存后自动拉取净值</div>
+        </div>
+      ):(
+        <>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,margin:"1px 0",background:C.border}}>
+            <div style={{background:C.card,padding:20}}>
+              <div style={sLabel}>仓位占比</div>
+              {pieData.length>0?<PieChart data={pieData}/>:<div style={{height:160,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:11}}>暂无数据</div>}
+              <div style={{display:"flex",flexWrap:"wrap",gap:"4px 10px",marginTop:8}}>
+                {pieData.map((d,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:4,fontSize:10,color:C.muted}}><span style={{width:7,height:7,borderRadius:1,background:COLORS[i%COLORS.length],display:"inline-block"}}/>{d.name}</div>)}
+              </div>
+            </div>
+            <div style={{background:C.card,padding:20}}>
+              <div style={sLabel}>总资产走势</div>
+              {ph.length>1?<LineChart data={ph} color={C.accent}/>:<div style={{height:180,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:11}}>累积数据后显示</div>}
+            </div>
+          </div>
+          <div style={{padding:"16px 24px 8px",fontSize:10,letterSpacing:3,color:C.muted,textTransform:"uppercase"}}>持仓列表</div>
+          {stats.map((f,i)=><Row key={f.id} fund={f} color={COLORS[i%COLORS.length]} onDetail={()=>onDetail(f.id)} onEdit={()=>onEdit(f)} onDel={()=>onDel(f.id)} navId={navId} navInput={navInput} setNavInput={setNavInput} setNavId={setNavId} confirmNav={confirmNav} status={fs[f.id]}/>)}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════ ROW ════════════════════════════════════════════
+function Row({fund:f,color,onDetail,onEdit,onDel,navId,navInput,setNavInput,setNavId,confirmNav,status}) {
+  const isPos=f.pnl>=0,st=status?ST[status]:null,isUpd=navId===f.id;
+  return (
+    <div style={{borderTop:`1px solid ${C.border}`}}>
+      <div style={{padding:"14px 24px",display:"flex",alignItems:"center",gap:12}}>
+        <div style={{width:4,height:36,borderRadius:2,background:color,flexShrink:0}}/>
+        <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={onDetail}>
+          <div style={{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap"}}>
+            <span style={{fontSize:14}}>{f.name||f.code}</span>
+            <span style={{fontSize:10,color:C.muted}}>{f.code}</span>
+            <span style={{fontSize:9,padding:"1px 5px",borderRadius:2,background:C.accentDim,color:C.accent}}>{f.type}</span>
+            {st&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:2,background:`${st.color}18`,color:st.color}}>{st.label}</span>}
+          </div>
+          <div style={{display:"flex",gap:14,marginTop:3}}>
+            <span style={{fontSize:11,color:C.muted}}>¥{fmt(f.curValue)}</span>
+            <span style={{fontSize:11,color:isPos?C.green:C.red,fontWeight:500}}>{fmtPct(f.pnlPct)} · {isPos?"+":""}¥{fmt(f.pnl)}</span>
+          </div>
+        </div>
+        <div style={{textAlign:"right",flexShrink:0}}>
+          <div style={{fontSize:15}}>{fmt(f.cur,4)}</div>
+          <div style={{fontSize:9,color:C.muted}}>净值</div>
+        </div>
+        <div style={{display:"flex",gap:5,flexShrink:0}}>
+          <button onClick={()=>{setNavId(f.id);setNavInput(f.currentNav);}} style={iBtn} title="手动更新">✎</button>
+          <button onClick={onEdit} style={iBtn}>⚙</button>
+          <button onClick={onDel} style={{...iBtn,color:C.red}}>×</button>
+        </div>
+      </div>
+      {isUpd&&(
+        <div style={{padding:"0 24px 14px",display:"flex",gap:8}}>
+          <input type="number" step="0.0001" placeholder="手动输入净值" value={navInput} onChange={e=>setNavInput(e.target.value)} style={inp} onKeyDown={e=>e.key==="Enter"&&confirmNav(f.id)} autoFocus/>
+          <button onClick={()=>confirmNav(f.id)} style={btn(C.accent,"#fff",true)}>确认</button>
+          <button onClick={()=>setNavId(null)} style={btn(C.border,C.muted,true)}>取消</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════ DETAIL ════════════════════════════════════════
+function Detail({fund:f,onBack,onEdit,navId,navInput,setNavInput,setNavId,confirmNav,fs,onFetch,onAnalysis}) {
+  const isPos=f.pnl>=0,status=fs?.[f.id],st=status?ST[status]:null,histData=(f.history||[]).filter(h=>h.nav);
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,paddingBottom:60}}>
+      <div style={{padding:"24px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:10}}>
+        <button onClick={onBack} style={{...iBtn,fontSize:15,padding:"4px 10px"}}>←</button>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+            <span style={{fontSize:16}}>{f.name}</span>
+            {st&&<span style={{fontSize:9,padding:"2px 7px",borderRadius:2,background:`${st.color}18`,color:st.color}}>{st.label}</span>}
+          </div>
+          <div style={{fontSize:10,color:C.muted,marginTop:2}}>{f.code} · {f.type}</div>
+        </div>
+        <button onClick={onAnalysis} style={btn(C.gold,"#fff",true)}>✦ 分析</button>
+        <button onClick={onFetch} disabled={status==="loading"} style={btn(C.accentDim,C.accent,true,status==="loading")}>{status==="loading"?"更新中…":"⟳"}</button>
+        <button onClick={onEdit} style={btn(C.border,C.text,true)}>编辑</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:C.border,margin:"1px 0"}}>
+        {[{label:"买入金额",val:`¥${fmt(f.buy)}`},{label:"当前市值",val:`¥${fmt(f.curValue)}`},{label:"盈亏金额",val:`${f.pnl>=0?"+":""}¥${fmt(f.pnl)}`,color:isPos?C.green:C.red},{label:"收益率",val:fmtPct(f.pnlPct),color:isPos?C.green:C.red},{label:"成本净值",val:fmt(f.cost,4)},{label:"当前净值",val:fmt(f.cur,4)},{label:"持有份额",val:fmt(f.shares,2)},{label:"净值变动",val:`${f.cur>=f.cost?"+":""}${fmt(f.cur-f.cost,4)}`}].map((item,i)=>(
+          <div key={i} style={{background:C.card,padding:"14px 20px"}}>
+            <div style={{fontSize:10,color:C.muted,letterSpacing:2,marginBottom:4}}>{item.label}</div>
+            <div style={{fontSize:15,fontWeight:500,color:item.color||C.text}}>{item.val}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{padding:"20px 24px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={sLabel}>净值走势</div>
+          <button onClick={()=>{setNavId(f.id);setNavInput(f.currentNav);}} style={btn(C.accentDim,C.accent,true)}>手动更新</button>
+        </div>
+        {navId===f.id&&(
+          <div style={{display:"flex",gap:8,marginBottom:16}}>
+            <input type="number" step="0.0001" placeholder="输入最新净值" value={navInput} onChange={e=>setNavInput(e.target.value)} style={inp} onKeyDown={e=>e.key==="Enter"&&confirmNav(f.id)} autoFocus/>
+            <button onClick={()=>confirmNav(f.id)} style={btn(C.accent,"#fff",true)}>确认</button>
+            <button onClick={()=>setNavId(null)} style={btn(C.border,C.muted,true)}>取消</button>
+          </div>
+        )}
+        {histData.length>1?<LineChart data={histData.map(h=>({date:h.date,value:h.nav}))} color={C.gold}/>:<div style={{height:140,border:`1px dashed ${C.border}`,borderRadius:4,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:11}}>多次更新后显示走势图</div>}
+      </div>
+      {/* AI 分析入口 */}
+      <div style={{margin:"0 24px",padding:16,background:`${C.gold}10`,border:`1px solid ${C.gold}44`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div>
+          <div style={{fontSize:13,color:C.text}}>✦ AI 智能分析</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:2}}>走势判断 · 买卖建议 · 定投 · 做T</div>
+        </div>
+        <button onClick={onAnalysis} style={btn(C.gold,"#fff",true)}>进入分析</button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════ FORM ════════════════════════════════════════
+function Form({form,setForm,onSave,onCancel,isEdit}) {
+  const set=k=>e=>setForm(p=>({...p,[k]:e.target.value}));
+  const codeOk=/^\d{6}$/.test(form.code);
+  return (
+    <div style={{minHeight:"100vh",background:C.bg}}>
+      <div style={{padding:"24px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:12}}>
+        <button onClick={onCancel} style={{...iBtn,fontSize:15,padding:"4px 10px"}}>←</button>
+        <div style={{fontSize:16}}>{isEdit?"编辑基金":"添加基金"}</div>
+      </div>
+      <div style={{padding:24,display:"flex",flexDirection:"column",gap:16,maxWidth:480}}>
+        <div>
+          <div style={fLabel}>基金代码</div>
+          <input type="text" placeholder="6位数字，如 110020" value={form.code} onChange={set("code")} style={inp} maxLength={6}/>
+          {form.code&&!codeOk&&<div style={{fontSize:10,color:C.red,marginTop:4}}>请输入6位数字代码</div>}
+          {codeOk&&<div style={{fontSize:10,color:C.green,marginTop:4}}>✓ 保存后自动从天天基金拉取净值</div>}
+        </div>
+        {[{label:"基金名称",key:"name",placeholder:"如 易方达沪深300ETF"},{label:"买入金额 (¥)",key:"buyAmount",placeholder:"如 10000",type:"number"},{label:"持有份额",key:"shares",placeholder:"如 823.16，同花顺详情页可查",type:"number"}].map(item=>(
+          <div key={item.key}>
+            <div style={fLabel}>{item.label}</div>
+            <input type={item.type||"text"} placeholder={item.placeholder} value={form[item.key]} onChange={set(item.key)} style={inp}/>
+          </div>
+        ))}
+        <div>
+          <div style={fLabel}>基金类型</div>
+          <select value={form.type} onChange={set("type")} style={{...inp,cursor:"pointer"}}>
+            {["A股公募","ETF场内","港股基金","美股基金","债券基金","货币基金"].map(t=><option key={t}>{t}</option>)}
+          </select>
+        </div>
+        {form.buyAmount&&form.shares&&parseFloat(form.shares)>0&&<div style={{fontSize:10,color:C.muted,padding:"8px 0"}}>成本净值将自动计算为 {(parseFloat(form.buyAmount)/parseFloat(form.shares)).toFixed(4)}</div>}
+        <div style={{display:"flex",gap:12,marginTop:8}}>
+          <button onClick={onSave} style={{...btn(C.accent,"#fff"),flex:1,padding:"12px 0"}}>{isEdit?"保存修改":"添加持仓"}</button>
+          <button onClick={onCancel} style={{...btn(C.border,C.muted),flex:1,padding:"12px 0"}}>取消</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 样式 ──────────────────────────────────────────────────────────────────
+const sLabel={fontSize:10,letterSpacing:3,color:C.muted,textTransform:"uppercase",marginBottom:12};
+const fLabel={fontSize:10,color:C.muted,letterSpacing:2,marginBottom:6,textTransform:"uppercase"};
+const iBtn={background:"transparent",border:`1px solid ${C.border}`,color:C.muted,borderRadius:4,padding:"4px 8px",cursor:"pointer",fontSize:13};
+const inp={width:"100%",background:C.card,border:`1px solid ${C.border}`,color:C.text,borderRadius:4,padding:"10px 12px",fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"};
+const btn=(bg,color,small,disabled)=>({background:(bg===C.border||bg===C.accentDim)?"transparent":bg,border:`1px solid ${bg===C.accentDim?C.accent:bg}`,color,borderRadius:4,padding:small?"6px 14px":"8px 16px",cursor:disabled?"not-allowed":"pointer",fontSize:small?11:13,fontFamily:"inherit",letterSpacing:1,whiteSpace:"nowrap",opacity:disabled?0.5:1});
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
